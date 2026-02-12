@@ -1,0 +1,30 @@
+{
+  "name": "dbserver1-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "cdc_user",
+    "database.password": "cdc_pass",
+    "database.dbname": "cdc_db",
+
+    "topic.prefix": "dbserver1",
+    "table.include.list": "public.merchants,public.payments",
+
+    "plugin.name": "pgoutput",
+    "slot.name": "debezium_slot",
+    "publication.name": "dbz_publication",
+    "publication.autocreate.mode": "filtered",
+
+    "snapshot.mode": "initial",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+
+    "decimal.handling.mode": "double",
+    "tombstones.on.delete": "true"
+  }
+}

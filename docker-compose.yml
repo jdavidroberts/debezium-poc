@@ -1,0 +1,132 @@
+# CDC Pipeline POC: PostgreSQL → Debezium → Kafka → Spark Structured Streaming → Iceberg
+#
+# Versions (as of early 2026):
+#   Postgres 17 | Kafka 3.7 (CP 7.7.1) | Debezium 2.7 | Spark 3.5 | Iceberg 1.6.1
+#
+# Usage:  docker compose up -d --build
+# Teardown: docker compose down -v   (the -v removes named volumes)
+
+services:
+
+  # ─── Source Database ──────────────────────────────────────────────────
+  postgres:
+    image: postgres:17
+    container_name: postgres
+    environment:
+      POSTGRES_USER: cdc_user
+      POSTGRES_PASSWORD: cdc_pass
+      POSTGRES_DB: cdc_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pgdata:/var/lib/postgresql/data
+    # Enable logical replication at the server level (required for Debezium)
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=4
+      - -c
+      - max_replication_slots=4
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cdc_user -d cdc_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ─── ZooKeeper (required by CP Kafka 7.7) ─────────────────────────────
+  # Note: Kafka 4.x dropped ZooKeeper in favour of KRaft.  We use CP 7.7
+  # (Kafka 3.7) here because Debezium 2.x targets the Kafka 3.x wire protocol
+  # and the ecosystem tooling is most mature against this combination.
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.7.1
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  # ─── Kafka Broker ─────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"          # host access (PLAINTEXT_HOST listener)
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Two listeners: one for inter-container traffic, one for host tools
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ─── Debezium Kafka Connect ──────────────────────────────────────────
+  # The quay.io/debezium/connect image ships with the Postgres connector
+  # pre-installed.  We just need to POST a connector config after startup.
+  connect:
+    image: quay.io/debezium/connect:2.7
+    container_name: connect
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+
+  # ─── Spark + Iceberg ─────────────────────────────────────────────────
+  # Custom image with Iceberg runtime + Kafka connector JARs baked in.
+  # The container idles (tail -f) so you can `exec` into it to run jobs.
+  spark-iceberg:
+    build: ./spark
+    container_name: spark-iceberg
+    depends_on:
+      - kafka
+    volumes:
+      - ./spark/cdc_to_iceberg.py:/opt/spark-app/cdc_to_iceberg.py
+      - iceberg-warehouse:/tmp/iceberg_warehouse
+      - spark-checkpoints:/tmp/checkpoints
+    entrypoint: ["tail", "-f", "/dev/null"]
+
+  # ─── Kafka UI (optional — handy for inspecting topics & messages) ───
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      - kafka
+      - connect
+    ports:
+      - "8080:8080"
+    environment:
+      DYNAMIC_CONFIG_ENABLED: "true"
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: debezium
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://connect:8083
+
+volumes:
+  pgdata:
+  iceberg-warehouse:
+  spark-checkpoints:
